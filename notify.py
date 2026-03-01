@@ -213,6 +213,12 @@ def send_line_message(message: str):
 
 
 def main():
+    # テストモード：TEST_MODE=1 の場合はLINEにテストメッセージを送って終了
+    if os.environ.get("TEST_MODE") == "1":
+        send_line_message("✅ テスト通知\nFX経済指標通知システムが正常に動作しています。")
+        print("テストメッセージを送信しました")
+        return
+
     now_utc = datetime.now(timezone.utc)
     print(f"実行時刻(UTC): {now_utc.strftime('%Y-%m-%d %H:%M:%S')}")
 
