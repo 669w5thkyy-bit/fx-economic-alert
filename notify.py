@@ -1,11 +1,13 @@
 """
 FX経済指標 15分前 LINE通知スクリプト
+データソース: みんかぶFX (https://fx.minkabu.jp/indicators)
 GitHub Actions で5分ごとに実行される
 """
 
 import os
-import json
+import re
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 
 import pytz
@@ -15,150 +17,109 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 LINE_USER_ID = os.environ["LINE_USER_ID"]
 JST = pytz.timezone("Asia/Tokyo")
 
-# 監視する通貨（Forex Factory の country コード）
-WATCHED_COUNTRIES = {"USD", "JPY", "EUR", "GBP"}
+# 監視する国コード（みんかぶの data_country 属性）
+# US=USD, JP=JPY, EU=EUR, GB=GBP, AU=AUD, CA=CAD, CH=CHF, NZ=NZD
+WATCHED_COUNTRIES = {"US", "JP", "EU", "GB"}
 
-# 通知対象の最低インパクト（"High" のみ）
-MIN_IMPACT = "High"
+# 通知対象の最低重要度（1〜5の星の数。3以上を対象）
+MIN_IMPORTANCE = 3
 
 # 通知タイミング設定
 NOTIFY_MINUTES_BEFORE = 15  # 発表の何分前に通知するか
 WINDOW_MINUTES = 4           # ±何分の誤差を許容するか（GitHub Actionsの遅延対策）
 
-# ── 厳選した経済指標リスト ────────────────────────────
-# ※ Highインパクトのみでも十分だが、以下を明示的にホワイトリスト管理
-# ※ Trueの場合はHigh全部、Falseの場合は下記リストのみ
-USE_ALL_HIGH_IMPACT = True
-
-INDICATOR_WHITELIST = {
-    "USD": [
-        "Non-Farm Employment Change",
-        "Unemployment Rate",
-        "FOMC Statement",
-        "Federal Funds Rate",
-        "CPI m/m",
-        "Core CPI m/m",
-        "GDP q/q",
-        "Prelim GDP q/q",
-        "Retail Sales m/m",
-        "ISM Manufacturing PMI",
-        "ISM Services PMI",
-        "Core PCE Price Index m/m",
-        "ADP Non-Farm Employment Change",
-        "JOLTS Job Openings",
-        "Trade Balance",
-        "Consumer Confidence",
-        "PPI m/m",
-    ],
-    "JPY": [
-        "BOJ Policy Rate",
-        "Monetary Policy Statement",
-        "Tankan Manufacturing Index",
-        "Tokyo Core CPI y/y",
-        "CPI y/y",
-        "GDP q/q",
-        "Retail Sales y/y",
-    ],
-    "EUR": [
-        "Main Refinancing Rate",
-        "ECB Press Conference Starts",
-        "German Prelim CPI m/m",
-        "Flash GDP q/q",
-        "CPI Flash Estimate y/y",
-    ],
-    "GBP": [
-        "Official Bank Rate",
-        "MPC Official Bank Rate Votes",
-        "CPI y/y",
-        "GDP m/m",
-        "Retail Sales m/m",
-    ],
-}
-
-# ── 国旗マッピング ────────────────────────────────────
-COUNTRY_FLAG = {
-    "USD": "🇺🇸",
-    "JPY": "🇯🇵",
-    "EUR": "🇪🇺",
-    "GBP": "🇬🇧",
-    "AUD": "🇦🇺",
-    "CAD": "🇨🇦",
-    "CHF": "🇨🇭",
-    "NZD": "🇳🇿",
+# ── 国コード → 通貨・表示名マッピング ─────────────────
+COUNTRY_INFO = {
+    "US": {"currency": "USD", "flag": "🇺🇸"},
+    "JP": {"currency": "JPY", "flag": "🇯🇵"},
+    "EU": {"currency": "EUR", "flag": "🇪🇺"},
+    "GB": {"currency": "GBP", "flag": "🇬🇧"},
+    "AU": {"currency": "AUD", "flag": "🇦🇺"},
+    "CA": {"currency": "CAD", "flag": "🇨🇦"},
+    "CH": {"currency": "CHF", "flag": "🇨🇭"},
+    "NZ": {"currency": "NZD", "flag": "🇳🇿"},
 }
 
 
 def fetch_calendar() -> list:
-    """Forex Factory APIから今週・来週のカレンダーを取得"""
-    events = []
-    for week in ["thisweek", "nextweek"]:
-        url = f"https://nfs.faireconomy.media/ff_calendar_{week}.json"
-        try:
-            resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            events.extend(resp.json())
-        except Exception as e:
-            print(f"[WARN] カレンダー取得エラー ({week}): {e}")
-    return events
-
-
-def parse_event_time(event: dict):
-    """
-    イベントのdate + timeフィールドをUTCのdatetimeに変換する。
-    date例: "2024-01-05T00:00:00-05:00"
-    time例: "8:30am" / "All Day" / "Tentative"
-    """
-    date_str = event.get("date", "")
-    time_str = event.get("time", "").strip()
-
-    if not time_str or time_str in ("All Day", "Tentative", ""):
-        return None
-
+    """みんかぶFXの経済指標カレンダーをスクレイピングして取得"""
+    url = "https://fx.minkabu.jp/indicators"
     try:
-        # タイムゾーンオフセットを取得（例: -05:00 または -04:00）
-        tz_part = date_str[19:]  # "T00:00:00-05:00" → "-05:00"
-        sign = 1 if tz_part[0] == "+" else -1
-        tz_hours = int(tz_part[1:3])
-        tz_minutes = int(tz_part[4:6])
-        tz_offset = timezone(timedelta(hours=sign * tz_hours, minutes=sign * tz_minutes))
-
-        # 日付を取得（"2024-01-05"）
-        year = int(date_str[0:4])
-        month = int(date_str[5:7])
-        day = int(date_str[8:10])
-
-        # 時刻をパース（"8:30am" → hour, minute）
-        t = time_str.lower()
-        is_pm = t.endswith("pm")
-        t = t.replace("am", "").replace("pm", "").strip()
-        hour, minute = map(int, t.split(":"))
-        if is_pm and hour != 12:
-            hour += 12
-        elif not is_pm and hour == 12:
-            hour = 0
-
-        event_dt = datetime(year, month, day, hour, minute, tzinfo=tz_offset)
-        return event_dt.astimezone(timezone.utc)
-
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
     except Exception as e:
-        print(f"[WARN] 時刻パースエラー: {e}  date={date_str!r}  time={time_str!r}")
-        return None
+        print(f"[ERR] カレンダー取得失敗: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    events = []
+
+    for table in soup.find_all("table"):
+        # テーブルのキャプション（日付）を取得
+        caption = table.find("caption")
+        if not caption:
+            continue
+
+        # 日付をパース（例: "2026年03月02日(月)"）
+        date_text = caption.get_text(strip=True)
+        date_match = re.search(r"(\d{4})年(\d{2})月(\d{2})日", date_text)
+        if not date_match:
+            continue
+        year, month, day = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
+
+        for tr in table.find_all("tr"):
+            country = tr.get("data_country", "")
+            importance_str = tr.get("data_importance", "0")
+
+            # 時刻を取得
+            time_td = tr.find("td", class_=lambda c: c and "eilist__time" in c)
+            if not time_td:
+                continue
+            time_span = time_td.find("span")
+            if not time_span:
+                continue
+            time_text = time_span.get_text(strip=True)
+            if not re.match(r"^\d{1,2}:\d{2}$", time_text):
+                continue
+
+            # 指標名を取得
+            name_p = tr.find("p", class_=lambda c: c and "flexbox__grow" in c)
+            if not name_p:
+                continue
+            title = name_p.get_text(strip=True)
+
+            # 予想値・前回値を取得（eilist__data クラスのtd）
+            data_tds = tr.find_all("td", class_=lambda c: c and "eilist__data" in c)
+            forecast = data_tds[0].get_text(strip=True) if len(data_tds) > 0 else ""
+            previous = data_tds[1].get_text(strip=True) if len(data_tds) > 1 else ""
+            forecast = "" if forecast in ("---", "") else forecast
+            previous = "" if previous in ("---", "") else previous
+
+            # 時刻をJSTのdatetimeに変換してUTCにする
+            hour, minute = map(int, time_text.split(":"))
+            event_dt_jst = JST.localize(datetime(year, month, day, hour, minute))
+            event_dt_utc = event_dt_jst.astimezone(timezone.utc)
+
+            events.append({
+                "country": country,
+                "importance": int(importance_str),
+                "title": title,
+                "time_utc": event_dt_utc,
+                "time_jst": event_dt_jst,
+                "forecast": forecast,
+                "previous": previous,
+            })
+
+    return events
 
 
 def is_target_event(event: dict) -> bool:
     """通知対象の指標かどうかを判定"""
-    country = event.get("country", "")
-    impact = event.get("impact", "")
-    title = event.get("title", "")
-
-    if country not in WATCHED_COUNTRIES:
+    if event["country"] not in WATCHED_COUNTRIES:
         return False
-    if impact != MIN_IMPACT:
+    if event["importance"] < MIN_IMPORTANCE:
         return False
-    if USE_ALL_HIGH_IMPACT:
-        return True
-    # ホワイトリストモード
-    return title in INDICATOR_WHITELIST.get(country, [])
+    return True
 
 
 def should_notify(event_time_utc: datetime, now_utc: datetime) -> bool:
@@ -169,24 +130,22 @@ def should_notify(event_time_utc: datetime, now_utc: datetime) -> bool:
     return -half <= delta_sec <= half
 
 
-def build_message(event: dict, event_time_utc: datetime) -> str:
+def build_message(event: dict) -> str:
     """LINE通知メッセージを作成"""
-    event_time_jst = event_time_utc.astimezone(JST)
-    country = event.get("country", "")
-    flag = COUNTRY_FLAG.get(country, "")
-    time_str = event_time_jst.strftime("%H:%M")
-    forecast = event.get("forecast", "")
-    previous = event.get("previous", "")
+    country = event["country"]
+    info = COUNTRY_INFO.get(country, {"currency": country, "flag": ""})
+    time_str = event["time_jst"].strftime("%H:%M")
+    stars = "★" * event["importance"] + "☆" * (5 - event["importance"])
 
     lines = [
         f"⚠️ 経済指標 {NOTIFY_MINUTES_BEFORE}分前",
-        f"{flag} {country} - {event.get('title', '')}",
-        f"発表: {time_str} JST",
+        f"{info['flag']} {info['currency']} - {event['title']}",
+        f"発表: {time_str} JST  {stars}",
     ]
-    if forecast:
-        lines.append(f"予想: {forecast}")
-    if previous:
-        lines.append(f"前回: {previous}")
+    if event["forecast"]:
+        lines.append(f"予想: {event['forecast']}")
+    if event["previous"]:
+        lines.append(f"前回: {event['previous']}")
     return "\n".join(lines)
 
 
@@ -207,7 +166,7 @@ def send_line_message(message: str):
         timeout=10,
     )
     if resp.status_code == 200:
-        print(f"[OK] LINE通知送信成功")
+        print("[OK] LINE通知送信成功")
     else:
         print(f"[ERR] LINE送信エラー: {resp.status_code} {resp.text}")
 
@@ -230,13 +189,9 @@ def main():
         if not is_target_event(event):
             continue
 
-        event_time_utc = parse_event_time(event)
-        if event_time_utc is None:
-            continue
-
-        if should_notify(event_time_utc, now_utc):
-            message = build_message(event, event_time_utc)
-            print(f"通知対象: {event.get('title')} / {event.get('country')}")
+        if should_notify(event["time_utc"], now_utc):
+            message = build_message(event)
+            print(f"通知対象: {event['title']} / {event['country']}")
             send_line_message(message)
             notified += 1
 
