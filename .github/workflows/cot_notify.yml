@@ -1,0 +1,32 @@
+name: COTレポート 週次通知
+
+on:
+  schedule:
+    # 毎週金曜 21:30 UTC（土曜 06:30 JST）に実行
+    # CFTCのレポートは金曜 20:30 UTC（3:30 PM ET）に公開される
+    - cron: '30 21 * * 5'
+  # 手動実行も可能
+  workflow_dispatch:
+
+jobs:
+  cot-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存パッケージをインストール
+        run: pip install requests pytz
+
+      - name: COT通知スクリプトを実行
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: python cot_notify.py
