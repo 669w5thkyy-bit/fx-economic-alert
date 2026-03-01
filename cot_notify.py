@@ -105,7 +105,7 @@ def build_message(data: list) -> str:
     now_jst = datetime.now(JST).strftime("%Y/%m/%d")
 
     lines = [
-        f"📊 COTレポート（{now_jst}）",
+        f"COTレポート（{now_jst}）",
         f"集計基準日：{date_str}",
         f"対象：投機筋（Leveraged Funds）",
         "━━━━━━━━━━━━━━",
