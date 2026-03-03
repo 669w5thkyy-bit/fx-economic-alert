@@ -26,7 +26,7 @@ MIN_IMPORTANCE = 3
 
 # 通知タイミング設定
 NOTIFY_MINUTES_BEFORE = 15  # 発表の何分前に通知するか
-WINDOW_MINUTES = 4           # ±何分の誤差を許容するか（GitHub Actionsの遅延対策）
+WINDOW_MINUTES = 6           # ±何分の誤差を許容するか（GitHub Actionsの遅延対策）
 
 # ── 国コード → 通貨・表示名マッピング ─────────────────
 COUNTRY_INFO = {
